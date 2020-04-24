@@ -22,6 +22,7 @@ import shutil
 import random
 import itertools
 import multiprocessing
+import subprocess
 from .assembly_graph import AssemblyGraph
 from .assembly_graph_copy_depth import determine_copy_depth
 from .bridge_long_read_simple import create_simple_long_read_bridges
@@ -48,6 +49,12 @@ from . import log
 from . import settings
 from .version import __version__
 
+class CannotSample(Exception):
+    def __init__(self, message):
+        self.message = message
+
+    def __str__(self):
+        return repr(self.message)
 
 def main():
     """
@@ -80,12 +87,64 @@ def main():
                     'SPAdes:\n  ' + best_spades_graph)
             graph = AssemblyGraph(best_spades_graph, None)
         else:
-            graph = get_best_spades_graph(args.short1, args.short2, args.unpaired, args.out,
-                                          args.depth_filter, args.verbosity,
-                                          args.spades_path, args.threads, args.keep,
-                                          args.kmer_count, args.min_kmer_frac, args.max_kmer_frac,
-                                          args.kmers, args.no_correct, args.linear_seqs,
-                                          args.spades_tmp_dir, args.largest_component)
+            # Run seqtk to fractionate reads for the spades graph construction (will make it faster)
+            if args.spades_read_fraction != None:
+                temp_path_1 = os.path.join(args.out,'short1.fq')
+                seqtk_command_1 = [args.seqtk_path, 'sample', '-s12345', args.short1,
+                    str(args.spades_read_fraction), '>', temp_path_1]
+                try:
+                    f = open(temp_path_1,'w+')
+                    subprocess.call(seqtk_command_1, stderr=subprocess.STDOUT, stdout=f)
+                    f.close()
+                except subprocess.CalledProcessError as e:
+                    raise CannotSample('The short reads 1 file failed to be fractionated by seqtk')
+                gzip_command_1 = [args.gzip_path, temp_path_1]
+                try:
+                    subprocess.check_output(gzip_command_1, stderr=subprocess.STDOUT)
+                except subprocess.CalledProcessError as e:
+                    raise CannotSample('The short reads 1 file failed to gzip after seqtk sampling')
+                spades_reads_1 = temp_path_1 + '.gz'
+                
+                temp_path_2 = os.path.join(args.out,'short2.fq')
+                seqtk_command_2 = [args.seqtk_path, 'sample', '-s12345', args.short2,
+                    str(args.spades_read_fraction), '>', temp_path_2]
+                try:
+                    f = open(temp_path_2,'w+')
+                    subprocess.call(seqtk_command_2, stderr=subprocess.STDOUT, stdout=f)
+                    f.close()
+                except subprocess.CalledProcessError as e:
+                    raise CannotSample('The short reads 2 file failed to be fractionated by seqtk')
+                gzip_command_2 = [args.gzip_path, temp_path_2]
+                try:
+                    subprocess.check_output(gzip_command_2, stderr=subprocess.STDOUT)
+                except subprocess.CalledProcessError as e:
+                    raise CannotSample('The short reads 2 file failed to gzip after seqtk sampling')
+                spades_reads_2 = temp_path_2 + '.gz'
+            else:
+                spades_reads_1 = args.short1
+                spades_reads_2 = args.short2
+            # If the user asks for a run continuation and the graph is already there, then spades finished.
+            if args.continue_run and os.path.exists(best_spades_graph):
+                graph = AssemblyGraph(best_spades_graph, False)
+            else:
+                if args.continue_run and os.path.isdir(os.path.join(args.out, 'spades_assembly')):
+                    spades_continue = True
+                else:
+                    spades_continue = False
+                graph = get_best_spades_graph(spades_reads_1, spades_reads_2, args.unpaired, args.out,
+                    args.depth_filter, args.verbosity,
+                    args.spades_path, args.threads, args.keep,
+                    args.kmer_count, args.min_kmer_frac, args.max_kmer_frac,
+                    args.kmers, args.no_correct, args.linear_seqs,
+                    args.spades_tmp_dir, args.largest_component, args.spades_trusted_contigs,
+                    args.spades_untrusted_contigs, args.spades_careful, spades_continue)
+            
+            # After running spades, remove the seqtk sample files to free up space
+            if args.spades_read_fraction != None:
+                if spades_reads_1 != args.short1:
+                    os.remove(spades_reads_1)
+                if spades_reads_2 != args.short2:
+                    os.remove(spades_reads_2)
         determine_copy_depth(graph)
         if args.keep > 0 and not os.path.isfile(best_spades_graph):
             graph.save_to_gfa(best_spades_graph, save_copy_depth_info=True, newline=True,
@@ -165,13 +224,13 @@ def main():
         if not args.no_long_read_alignment:
             read_names, min_scaled_score, min_alignment_length = \
                 align_long_reads_to_assembly_graph(graph, anchor_segments, args, full_command,
-                                                   read_dict, read_names, long_read_filename)
+                                               read_dict, read_names, long_read_filename)
 
             expected_linear_seqs = args.linear_seqs > 0
             bridges += create_long_read_bridges(graph, read_dict, read_names, anchor_segments,
-                                                args.verbosity, min_scaled_score, args.threads,
-                                                scoring_scheme, min_alignment_length,
-                                                expected_linear_seqs, args.min_bridge_qual)
+                                            args.verbosity, min_scaled_score, args.threads,
+                                            scoring_scheme, min_alignment_length,
+                                            expected_linear_seqs, args.min_bridge_qual)
 
     if short_reads_available:
         seg_nums_used_in_bridges = graph.apply_bridges(bridges, args.verbosity,
@@ -210,7 +269,7 @@ def main():
     insert_size_1st, insert_size_99th = None, None
     if short_reads_available and not args.no_pilon:
         insert_size_1st, insert_size_99th = \
-            final_polish(graph, args, counter, long_reads_available)
+            final_polish(graph, args, counter, long_reads_available or args.polish_all)
 
     if not args.no_rotate:
         rotate_completed_replicons(graph, args, counter)
@@ -355,7 +414,29 @@ def get_arguments():
                                    "option (default: make a temporary directory in the output "
                                    "directory)"
                                    if show_all_args else argparse.SUPPRESS)
-
+    spades_group.add_argument('--spades_trusted_contigs', type=str, default='',
+                                help='Trusted contigs from other assembly methods to add to SPAdes'
+                                if show_all_args else argparse.SUPPRESS)
+    spades_group.add_argument('--spades_untrusted_contigs', type=str, default='',
+                                help='Untrusted contigs to add to SPAdes assembly'
+                                if show_all_args else argparse.SUPPRESS)
+    spades_group.add_argument('--spades_careful', action='store_true',
+                                help='Run SPAdes with --careful option'
+                                if show_all_args else argparse.SUPPRESS)
+    spades_group.add_argument('--continue_run', action='store_true',
+                                help='Try to continue a previously stopped Unicycler run'
+                                if show_all_args else argparse.SUPPRESS)
+    # SEQTK sampling path
+    seqtk_group = parser.add_argument_group('seqtk sampling')
+    seqtk_group.add_argument('--seqtk_path' , type=str, default='seqtk',
+                                help='Path to the seqtk executable'
+                                    if show_all_args else argparse.SUPPRESS)
+    seqtk_group.add_argument('--spades_read_fraction',type=float, default=None,
+                                help='Fraction/Number of reads to use in SPAdes'
+                                    if show_all_args else argparse.SUPPRESS)
+    seqtk_group.add_argument('--gzip_path', type=str, default='gzip',
+                                help='Path to the gzip executable'
+                                    if show_all_args else argparse.SUPPRESS)
     # Miniasm assembly options
     miniasm_group = parser.add_argument_group('miniasm+Racon assembly',
                                               'These options control the use of miniasm and Racon '
@@ -434,7 +515,9 @@ def get_arguments():
                               help='Contigs shorter than this value (bp) will not be polished '
                                    'using Pilon'
                                    if show_all_args else argparse.SUPPRESS)
-
+    polish_group.add_argument('--polish_all', action='store_true',
+                              help='Force Pilon to polish with the "all" option'
+                                   if show_all_args else argparse.SUPPRESS)
     # VCF options
     polish_group = parser.add_argument_group('VCF',
                                              'These options control the production of the VCF of '
@@ -546,6 +629,16 @@ def get_arguments():
         args.long = os.path.abspath(args.long)
     if args.spades_tmp_dir:
         args.spades_tmp_dir = os.path.abspath(args.spades_tmp_dir)
+    if args.spades_trusted_contigs != '':
+        args.spades_trusted_contigs = os.path.abspath(args.spades_trusted_contigs)
+    if args.spades_untrusted_contigs != '':
+        args.spades_untrusted_contigs = os.path.abspath(args.spades_untrusted_contigs)
+    if args.seqtk_path != '':
+        args.seqtk_path = os.path.abspath(args.seqtk_path)
+    
+    # If the user is specifying a fraction outside of bounds of reality, consider it as if they didn't specify a fraction
+    if args.spades_read_fraction != None and (args.spades_read_fraction >= 1 or args.spades_read_fraction <= 0):
+        args.spades_read_fraction = None
 
     if args.vcf and args.no_pilon:
         quit_with_error('cannot use --no_pilon with --vcf')
@@ -919,11 +1012,11 @@ def rotate_completed_replicons(graph, args, counter):
     if len(completed_replicons) > 0:
         log.log_section_header('Rotating completed replicons')
         log.log_explanation('Any completed circular contigs (i.e. single contigs which have one '
-                            'link connecting end to start) can have their start position changed '
-                            'without altering the sequence. For consistency, Unicycler now '
-                            'searches for a starting gene (dnaA or repA) in each such contig, and '
-                            'if one is found, the contig is rotated to start with that gene on '
-                            'the forward strand.')
+                    'link connecting end to start) can have their start position changed '
+                    'without altering the sequence. For consistency, Unicycler now '
+                    'searches for a starting gene (dnaA or repA) in each such contig, and '
+                    'if one is found, the contig is rotated to start with that gene on '
+                    'the forward strand.')
 
         rotation_result_table = [['Segment', 'Length', 'Depth', 'Starting gene', 'Position',
                                   'Strand', 'Identity', 'Coverage']]
