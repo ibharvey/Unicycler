@@ -633,8 +633,6 @@ def get_arguments():
         args.spades_trusted_contigs = os.path.abspath(args.spades_trusted_contigs)
     if args.spades_untrusted_contigs != '':
         args.spades_untrusted_contigs = os.path.abspath(args.spades_untrusted_contigs)
-    if args.seqtk_path != '':
-        args.seqtk_path = os.path.abspath(args.seqtk_path)
     
     # If the user is specifying a fraction outside of bounds of reality, consider it as if they didn't specify a fraction
     if args.spades_read_fraction != None and (args.spades_read_fraction >= 1 or args.spades_read_fraction <= 0):
